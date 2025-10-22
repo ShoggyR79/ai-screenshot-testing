@@ -14,6 +14,8 @@ This repo injects controlled randomness to demonstrate flakiness:
 - MUI side drawer with regenerated random info.
 - Discrete WASD box moves (5 units), hotkeys: W A S D, C (center without reorient), R (refresh info), ] (toggle drawer).
 
+<img width="1437" height="1208" alt="image" src="https://github.com/user-attachments/assets/04787b0b-3f60-4cb0-8254-08e89879e9ea" />
+
 ## Idea
 Replace / augment pixel diff with AI vision:
 1. Capture screenshot.
