@@ -33,7 +33,6 @@ export function createControls(camera: THREE.Camera, dom: HTMLCanvasElement) {
 }
 
 export function addHelpers(scene: THREE.Scene) {
-  scene.add(new THREE.AxesHelper(3))
   scene.add(new THREE.GridHelper(400, 80, 0x444444, 0x303030))
 }
 
@@ -59,6 +58,7 @@ export function createRectangle(scene: THREE.Scene) {
   const mat = new THREE.LineBasicMaterial({ color: 0x9ecaff, depthWrite: false })
   const line = new THREE.LineSegments(edges, mat)
   line.position.y = 0.505
+  line.name = 'MainBox' // added for tests
   scene.add(line)
   return { geo, edges, mat, line }
 }
