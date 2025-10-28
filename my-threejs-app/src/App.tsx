@@ -33,7 +33,7 @@ import {
 } from './utils/three'
 
 const DRAWER_WIDTH = 300
-const initialRandomness = true
+const initialRandomness = false
 
 function App() {
   const mountRef = useRef<HTMLDivElement>(null)
@@ -72,6 +72,7 @@ function App() {
 
   // Movement
   const step = 0.5
+  const rotationStep = THREE.MathUtils.degToRad(5) // added: 5° per press
   const keyDownMap: Record<string, boolean> = {}
 
   useEffect(() => {
@@ -172,6 +173,8 @@ function App() {
         case 's': rect.position.z += step; break
         case 'a': rect.position.x -= step; break
         case 'd': rect.position.x += step; break
+        case 'q': rect.rotation.y += rotationStep; break // rotate left
+        case 'e': rect.rotation.y -= rotationStep; break // rotate right
         case 'c': {
           const delta = new THREE.Vector3().subVectors(rect.position, controls.target)
           camera.position.add(delta)
@@ -217,6 +220,9 @@ function App() {
 
       controls.update()
       renderer.render(scene, camera)
+      if (!(window as any).__firstFrameDrawn) {
+        (window as any).__firstFrameDrawn = true
+      }
     }
     animate()
 
@@ -344,7 +350,7 @@ function App() {
           ))}
         </List>
         <Box sx={{ mt: 'auto', p: 2, fontSize: 11, opacity: 0.6 }}>
-          Hotkeys: W A S D move • C center • F focus • T top view • R refresh • ] drawer • N randomness
+          Hotkeys: W A S D move • Q/E rotate • C center • F focus • T top view • R refresh • ] drawer • N randomness
         </Box>
       </Drawer>
     </Box>

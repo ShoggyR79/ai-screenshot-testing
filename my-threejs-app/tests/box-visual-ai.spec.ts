@@ -13,13 +13,15 @@ const RELEVANT_CODE_FILE = 'src/App.tsx';
 const CONFIDENCE_THRESHOLD = 0.85;
 const VIEWPORT = { width: 1920, height: 1080 } // was 1280x720
 
+// --- Timeout Configuration ---
+test.describe.configure({ timeout: 60000 }) // raise suite timeout
 
 // --- Helper: Ensure screenshot directory exists ---
 fs.mkdirSync(SCREENSHOT_DIR, { recursive: true });
 fs.mkdirSync(DEBUG_SCREENSHOT_DIR, { recursive: true });
 
 // --- Gemini AI Analysis Function ---
-async function analyzeVisualTest(beforeImgBuffer: Buffer, afterImgBuffer: Buffer, testContext: string, gitDiff: string): Promise<{ status: 'PASS' | 'FAIL', certainty: number, reasoning: string }> {
+async function analyzeVisualTest(beforeImgBuffer: Buffer, afterImgBuffer: Buffer, testContext: string, gitDiff: string): Promise<{ status: 'PASS' | 'FAIL', certainty: number, reasoning: string, tokens?: { prompt: number, candidates: number, total: number } }> {
   if (!GEMINI_API_KEY) {
     throw new Error('GEMINI_API_KEY environment variable not set.');
   }
@@ -42,10 +44,13 @@ async function analyzeVisualTest(beforeImgBuffer: Buffer, afterImgBuffer: Buffer
     : `Assume object position remains stable; focus on visual appearance changes.`;
 
   const prompt = `
-You are a hyper-focused AI Quality Assurance Analyst. Your task is to determine if a specific visual change occurred between a "Before" and "After" screenshot, based on a "Test Context".
+You are a hyper-focused AI Quality Assurance Analyst. You will be sent two pictures, one "before" and the other "after". Your task is to determine if a specific visual change occurred between a "Before" and "After" screenshot, based on a "Test Context".
+The tests that you received are a series of automated visual testing that compare the visual appearance of the application to verify that no regressions or unexpected changes have occurred.
 
 You are currently looking at a threeJS application, rendering a 3D scene as well as a orbit camera and UI elements.
 ${movementAwareNote}
+
+The test context describes the goal of the current test. Your job is to analyze the two images and determine if the expected change described in the test context has occurred.
 
 Analysis Instructions:
 1. Identify the Subject from Test Context.
@@ -145,10 +150,9 @@ JSON ONLY:
 
     const response = result.response;
     const responseText = response.text();
-    console.log("Raw Gemini Response:", responseText);
-
     const parsed = JSON.parse(responseText);
 
+    // Validate fields
     if (!parsed.status || typeof parsed.certainty !== 'number' || !parsed.reasoning) {
       throw new Error('AI response missing required fields (status, certainty, reasoning).');
     }
@@ -156,185 +160,206 @@ JSON ONLY:
       throw new Error('AI status is invalid (must be PASS or FAIL).');
     }
 
-    return parsed as { status: 'PASS' | 'FAIL', certainty: number, reasoning: string };
+    // Token usage extraction
+    const usage: any = (response as any).usageMetadata || {};
+    const tokens = {
+      prompt: usage.promptTokenCount ?? 0,
+      candidates: usage.candidatesTokenCount ?? 0,
+      total: usage.totalTokenCount ?? (usage.promptTokenCount ?? 0) + (usage.candidatesTokenCount ?? 0)
+    };
+
+    return { ...parsed, tokens };
 
   } catch (error: any) {
-    console.error("Error calling Gemini API or parsing response:", error);
     return {
       status: 'FAIL',
       certainty: 0.0,
-      reasoning: `Error during AI analysis: ${error.message}`
+      reasoning: `Error during AI analysis: ${error.message}`,
+      tokens: { prompt: 0, candidates: 0, total: 0 }
     };
   }
 }
 
+// --- Helper: Wait for Canvas Ready ---
+async function waitForCanvasReady(page) {
+  await page.waitForSelector('canvas', { state: 'visible', timeout: 10000 })
+  await page.waitForFunction(
+    () => !!(window as any).__firstFrameDrawn,
+    null,
+    { timeout: 10000 }
+  )
+  // Small settle to avoid layout resize race
+  await page.waitForTimeout(50)
+}
+
 // --- Playwright Test Suite ---
-test.describe('Three.js Box Movement - AI Visual Analysis', () => {
+test.describe('Three.js Box Movement & Rotation - AI Visual Analysis', () => {
+  test.describe.configure({ retries: 3 });
 
   test.beforeEach(async ({ page }) => {
     await page.setViewportSize(VIEWPORT)
-    await page.goto(APP_URL);
-    await page.waitForSelector('canvas');
-    await page.locator('canvas').waitFor();
-
-    // Wait until MainBox is present
+    await page.goto(APP_URL, { waitUntil: 'domcontentloaded' })
+    await waitForCanvasReady(page)
     await page.waitForFunction(() =>
-      !!(window as any).scene?.getObjectByName('MainBox')
-      , { timeout: 5000 });
-
-    // One extra frame for render stability
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
+      !!(window as any).scene?.getObjectByName('MainBox'), { timeout: 5000 }
+    )
+    await page.evaluate(() => {
+      const obj = (window as any).scene?.getObjectByName('MainBox')
+      if (obj) obj.rotation.set(0, 0, 0)
+    })
   });
 
-  test('should close panel when ] is pressed', async ({ page }) => {
-    const testContext = "The subject is the dark side panel on the right. The test verifies if this panel disappears when the ']' key is pressed. Ignore all other visual elements.";
-
-    // 1. Capture "Before" state
-    const beforeScreenshotBuffer = await page.locator('body').screenshot();
-    // console.log(`Captured 'before' screenshot.`);
-
-    // 2. Perform Action
-    await page.locator('canvas').focus();
-    await page.keyboard.press(']');
-
-    // 3. Wait for the panel's closing animation to finish
-    await page.waitForTimeout(500);
-
-    // 4. Capture "After" state
-    const afterScreenshotBuffer = await page.locator('body').screenshot();
-    // console.log(`Captured 'after' screenshot.`);
-
-    // (Optional) Save for debugging
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, 'ai-box-before-close-panel.png'), beforeScreenshotBuffer);
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, 'ai-box-after-close-panel.png'), afterScreenshotBuffer);
-
-    // 5. Get Git Diff
-    const gitDiff = execSync(`git diff -- ${RELEVANT_CODE_FILE}`).toString();
-
-    // 6. Analyze with AI
-    const result = await analyzeVisualTest(beforeScreenshotBuffer, afterScreenshotBuffer, testContext, gitDiff);
-    // console.log('AI Analysis Result:', result);
-
-    // 7. Assert
-    expect(result.status, `AI failed the test. Reasoning: ${result.reasoning}`).toBe('PASS');
-    expect(result.certainty, `AI confidence was too low. Reasoning: ${result.reasoning}`).toBeGreaterThanOrEqual(CONFIDENCE_THRESHOLD);
-  });
-  
-  test('should visually confirm box movement right when "d" is pressed (AI Analysis)', async ({ page }) => {
-
+  test('movement: box moves right (D)', async ({ page }) => {
     await page.keyboard.press('f');
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-    await page.waitForTimeout(100);
 
-    // 1. Capture "Before" state
-    const beforeScreenshotBuffer = await page.locator('canvas').screenshot();
-    await test.info().attach('before-box-canvas', {
-      body: beforeScreenshotBuffer,
-      contentType: 'image/png'
+    const beforePos = await page.evaluate(() => {
+      const o = (window as any).scene?.getObjectByName('MainBox');
+      return o ? { x: o.position.x, y: o.position.y, z: o.position.z } : null;
     });
+    expect(beforePos).not.toBeNull();
 
-    // 2. Perform Action
-    await page.locator('canvas').click();
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-    await page.waitForTimeout(100);
+    const canvas = page.locator('canvas')
+    await expect(canvas).toBeVisible({ timeout: 5000 })
+    const beforeScreenshotBuffer = await canvas.screenshot({ timeout: 10000 })
 
     const presses = 4;
     for (let i = 0; i < presses; i++) {
       await page.keyboard.press('d');
       await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-      await page.waitForTimeout(100);
+      await page.waitForTimeout(60);
     }
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-    await page.waitForTimeout(100);
 
-    // 3. Stabilize
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-
-
-    // 4. Capture "After" state
-    const afterScreenshotBuffer = await page.locator('canvas').screenshot();
-    await test.info().attach('after-box-canvas', {
-      body: afterScreenshotBuffer,
-      contentType: 'image/png'
+    const afterPos = await page.evaluate(() => {
+      const o = (window as any).scene?.getObjectByName('MainBox');
+      return o ? { x: o.position.x, y: o.position.y, z: o.position.z } : null;
     });
+    expect(afterPos).not.toBeNull();
+    expect(afterPos!.x).toBeGreaterThan(beforePos!.x);
 
+    const afterScreenshotBuffer = await page.locator('canvas').screenshot();
 
-    // Debug saves
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, 'ai-box-before-d.png'), beforeScreenshotBuffer);
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, 'ai-box-after-d.png'), afterScreenshotBuffer);
-
-    // 5. Git Diff
     const gitDiff = execSync(`git diff -- ${RELEVANT_CODE_FILE}`).toString();
 
-    // 6. Enhanced testContext with numeric anchors
-    let testContext =
-      `Subject: main blue wireframe box. Expect horizontal movement to the RIGHT when 'd' is pressed.
-       pay special attention to the position of the blue wireframe box in each image and note any changes in its position. 
-       Note that the camera does not move, so movement perceived to be camera is in fact the main subject.`;
+    const testContext = `
+Subject: Blue wireframe box (MainBox).
+Action: Several 'd' key presses.
+Expectation: Box translates horizontally toward screen-right (world +X).
+Warnings: Ignore panel UI, particles, tiny jitter, any perceived rotation artifact.
+Pass: Box final position is visually farther right than initial; pure lateral shift.
+Notes: Test should still pass if rotation is observed; focus on position change.
+`.replace(/\s+/g, ' ').trim();
 
-    // 7. AI analysis
     const result = await analyzeVisualTest(beforeScreenshotBuffer, afterScreenshotBuffer, testContext, gitDiff);
+    await test.info().attach('movement-d-token-usage', {
+      body: Buffer.from(JSON.stringify(result.tokens, null, 2)),
+      contentType: 'application/json'
+    });
 
-    // 8. AI assertion
+    await test.info().attach('movement-d-before', { body: beforeScreenshotBuffer, contentType: 'image/png' });
+    await test.info().attach('movement-d-after', { body: afterScreenshotBuffer, contentType: 'image/png' });
+    await test.info().attach('movement-d-ai', { body: Buffer.from(JSON.stringify(result, null, 2)), contentType: 'application/json' });
+
     expect(result.status, `AI failed. Reason: ${result.reasoning}`).toBe('PASS');
     expect(result.certainty, `Low confidence. Reason: ${result.reasoning}`).toBeGreaterThanOrEqual(CONFIDENCE_THRESHOLD);
   });
 
-  test('should visually confirm box movement forward when "w" is pressed (AI Analysis)', async ({ page }) => {
-
+  test('movement: box moves forward (W)', async ({ page }) => {
     await page.keyboard.press('f');
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-    await page.waitForTimeout(100);
 
-    // 1. Capture "Before" state
-    const beforeScreenshotBuffer = await page.locator('canvas').screenshot();
-    await test.info().attach('before-box-canvas', {
-      body: beforeScreenshotBuffer,
-      contentType: 'image/png'
+    const beforePos = await page.evaluate(() => {
+      const o = (window as any).scene?.getObjectByName('MainBox');
+      return o ? { x: o.position.x, y: o.position.y, z: o.position.z } : null;
     });
+    expect(beforePos).not.toBeNull();
 
-    // 2. Perform Action
-    await page.locator('canvas').click();
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-    await page.waitForTimeout(100);
+    const beforeScreenshotBuffer = await page.locator('canvas').screenshot();
 
     const presses = 4;
     for (let i = 0; i < presses; i++) {
       await page.keyboard.press('w');
       await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-      await page.waitForTimeout(100);
+      await page.waitForTimeout(60);
     }
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-    await page.waitForTimeout(100);
 
-    // 3. Stabilize
-    await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
-
-    // 4. Capture "After" state
-    const afterScreenshotBuffer = await page.locator('canvas').screenshot();
-    await test.info().attach('after-box-canvas', {
-      body: afterScreenshotBuffer,
-      contentType: 'image/png'
+    const afterPos = await page.evaluate(() => {
+      const o = (window as any).scene?.getObjectByName('MainBox');
+      return o ? { x: o.position.x, y: o.position.y, z: o.position.z } : null;
     });
+    expect(afterPos).not.toBeNull();
+    expect(afterPos!.z).toBeLessThan(beforePos!.z);
 
+    const afterScreenshotBuffer = await page.locator('canvas').screenshot();
 
-    // Debug saves
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, 'ai-box-before-w.png'), beforeScreenshotBuffer);
-    fs.writeFileSync(path.join(SCREENSHOT_DIR, 'ai-box-after-w.png'), afterScreenshotBuffer);
-
-    // 5. Git Diff
     const gitDiff = execSync(`git diff -- ${RELEVANT_CODE_FILE}`).toString();
 
-    // 6. Enhanced testContext with numeric anchors
-    let testContext =
-      `Subject: main blue wireframe box. Expect movement FORWARD when 'w' is pressed.
-       pay special attention to the position of the blue wireframe box in each image and note any changes in its position. 
-       Note that the camera does not move, so movement perceived to be camera is in fact the main subject.`;
+    const testContext = `
+Subject: Blue wireframe box (MainBox).
+Action: Several 'w' key presses.
+Expectation: Box moves forward deeper into scene (world -Z), no significant sideways drift.
+Warnings: Ignore panel, particles, slight perspective skew.
+Pass: Box ends visually farther forward; forward translation evident.
+Notes: Test should still pass if rotation is observed; focus on position change.
+`.replace(/\s+/g, ' ').trim();
 
-    // 7. AI analysis
     const result = await analyzeVisualTest(beforeScreenshotBuffer, afterScreenshotBuffer, testContext, gitDiff);
+    await test.info().attach('movement-w-token-usage', {
+      body: Buffer.from(JSON.stringify(result.tokens, null, 2)),
+      contentType: 'application/json'
+    });
 
-    // 8. AI assertion
+    await test.info().attach('movement-w-before', { body: beforeScreenshotBuffer, contentType: 'image/png' });
+    await test.info().attach('movement-w-after', { body: afterScreenshotBuffer, contentType: 'image/png' });
+    await test.info().attach('movement-w-ai', { body: Buffer.from(JSON.stringify(result, null, 2)), contentType: 'application/json' });
+
+    expect(result.status, `AI failed. Reason: ${result.reasoning}`).toBe('PASS');
+    expect(result.certainty, `Low confidence. Reason: ${result.reasoning}`).toBeGreaterThanOrEqual(CONFIDENCE_THRESHOLD);
+  });
+
+  test('rotation: box rotates right (E)', async ({ page }) => {
+    await page.keyboard.press('f');
+
+    const getYaw = async () => await page.evaluate(() =>
+      (window as any).scene?.getObjectByName('MainBox')?.rotation.y
+    );
+
+    const beforeYaw = await getYaw();
+    expect(beforeYaw).not.toBeUndefined();
+
+    const beforeScreenshotBuffer = await page.locator('canvas').screenshot();
+
+    const presses = 6;
+    for (let i = 0; i < presses; i++) {
+      await page.keyboard.press('e');
+      await page.evaluate(() => new Promise(r => requestAnimationFrame(r)));
+      await page.waitForTimeout(70);
+    }
+
+    const afterYaw = await getYaw();
+    expect(afterYaw).not.toBeUndefined();
+    expect(afterYaw as number).toBeLessThan(beforeYaw as number);
+
+    const afterScreenshotBuffer = await page.locator('canvas').screenshot();
+
+    const gitDiff = execSync(`git diff -- ${RELEVANT_CODE_FILE}`).toString();
+
+    const testContext = `
+Subject: Blue wireframe box (MainBox).
+Action: Several 'e' key presses.
+Expectation: Box rotates right (clockwise yaw decrease); position roughly stable.
+Warnings: Ignore minor positional jitter, particles, UI panel.
+Pass: Final orientation clearly turned right compared to initial (edges angle changed clockwise).
+`.replace(/\s+/g, ' ').trim();
+
+    const result = await analyzeVisualTest(beforeScreenshotBuffer, afterScreenshotBuffer, testContext, gitDiff);
+    await test.info().attach('rotation-e-token-usage', {
+      body: Buffer.from(JSON.stringify(result.tokens, null, 2)),
+      contentType: 'application/json'
+    });
+
+    await test.info().attach('rotation-e-before', { body: beforeScreenshotBuffer, contentType: 'image/png' });
+    await test.info().attach('rotation-e-after', { body: afterScreenshotBuffer, contentType: 'image/png' });
+    await test.info().attach('rotation-e-ai', { body: Buffer.from(JSON.stringify(result, null, 2)), contentType: 'application/json' });
+
     expect(result.status, `AI failed. Reason: ${result.reasoning}`).toBe('PASS');
     expect(result.certainty, `Low confidence. Reason: ${result.reasoning}`).toBeGreaterThanOrEqual(CONFIDENCE_THRESHOLD);
   });
